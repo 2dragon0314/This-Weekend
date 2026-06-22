@@ -40,87 +40,99 @@ function extractArea(address) {
     return '기타';
 }
 
-function getSmartLink(providedUrl, title, isPerformance = false) {
+// 공연 외 일반 데이터들의 링크를 처리하는 기본 스마트 링크 함수 (인터파크 강제 이동 제거)
+function getSmartLink(providedUrl, title) {
     if (providedUrl && typeof providedUrl === 'string' && providedUrl.startsWith('http')) return providedUrl;
-    if (isPerformance) return `https://tickets.interpark.com/contents/search?keyword=${encodeURIComponent(title)}`;
     return `https://search.naver.com/search.naver?query=${encodeURIComponent(title)}`;
 }
 
-// ===== 기존 공공데이터 수집 함수들 (요약 처리) =====
-// (KOPIS, 축제, 교육, 관광, 부산, 박물관, 휴양림, 농촌, 캠핑장 - 이전과 동일하게 작동)
-// 코드가 너무 길어지는 것을 방지하기 위해 내부 로직은 유지한 채 하나로 묶었습니다.
-async function fetchPublicDataAll(DATA_KEY, todayStr) {
-    // (이전 코드에 있던 9개 fetch 함수들을 여기서 모두 호출한다고 가정 - 실제로는 아래 Promise.all에서 병렬 처리합니다)
-    return []; 
-}
-
-// 💡 새로 추가된 네이버 수집 함수
-async function fetchNaverBlogs(clientId, clientSecret) {
-    if (!clientId || !clientSecret) return [];
-    
-    const regionConfigs = [
-        { search: '서울', area: '서울' }, { search: '부산', area: '부산' },
-        { search: '대구', area: '대구' }, { search: '인천', area: '인천' },
-        { search: '광주', area: '전남광주' }, { search: '대전', area: '대전' },
-        { search: '울산', area: '울산' }, { search: '세종', area: '세종' },
-        { search: '경기', area: '경기' }, { search: '강원', area: '강원' },
-        { search: '충북', area: '충북' }, { search: '충남', area: '충남' },
-        { search: '전북', area: '전북' }, { search: '전남', area: '전남광주' },
-        { search: '경북', area: '경북' }, { search: '경남', area: '경남' },
-        { search: '제주', area: '제주' }
-    ];
-
-    const d = new Date();
-    const startStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-    d.setMonth(d.getMonth() + 1);
-    const endStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
-
-    const fetchPromises = regionConfigs.map(async (config, index) => {
-        const keyword = `${config.search} 주말 아이와 가볼만한 곳`;
-        const url = `https://openapi.naver.com/v1/search/blog.json?query=${encodeURIComponent(keyword)}&display=5&sort=sim`;
-        try {
-            const res = await fetch(url, { headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret } });
-            const data = await res.json();
-            if (data.items) {
-                return data.items.map((item, itemIndex) => ({
-                    id: `naver-${config.search}-${itemIndex}`, 
-                    title: `[${config.search} 추천] ` + item.title.replace(/<[^>]*>?/g, ''),
-                    category: "블로그 추천", location: "상세페이지 확인", 
-                    start_date: startStr, end_date: endStr, price: "무료~유료", 
-                    source: "네이버 검색", area: config.area, url: item.link
-                }));
-            }
-        } catch (e) {}
-        return [];
-    });
-
-    const resultsArray = await Promise.all(fetchPromises);
-    return resultsArray.flat();
-}
-
-// 공공 API 함수들 원본 (생략 없이 그대로 유지)
+// 💡 1. KOPIS 전용: 공연 목록 + 공연 상세 API를 모두 활용하는 업그레이드 함수
 async function fetchKopis() {
     const KOPIS_KEY = '928033e0198e4bdcb10e255f2ec72f85';
     const dStart = new Date(); const stdate = `${dStart.getFullYear()}${String(dStart.getMonth() + 1).padStart(2, '0')}${String(dStart.getDate()).padStart(2, '0')}`;
     const dEnd = new Date(); dEnd.setDate(dEnd.getDate() + 30); const eddate = `${dEnd.getFullYear()}${String(dEnd.getMonth() + 1).padStart(2, '0')}${String(dEnd.getDate()).padStart(2, '0')}`;
     const regions = { '11': '서울', '26': '부산', '27': '대구', '41': '경기' }; 
-    const results = [];
+    let allResults = [];
+
     for (const [code, regionName] of Object.entries(regions)) {
-        const url = `http://www.kopis.or.kr/openApi/restful/pblprfr?service=${KOPIS_KEY}&stdate=${stdate}&eddate=${eddate}&cpage=1&rows=100&signgucode=${code}`;
+        // 상세 API까지 찔러야 하므로, Vercel 시간초과 방지를 위해 rows를 30개로 안정화합니다.
+        const url = `http://www.kopis.or.kr/openApi/restful/pblprfr?service=${KOPIS_KEY}&stdate=${stdate}&eddate=${eddate}&cpage=1&rows=30&signgucode=${code}`;
         try {
             const res = await fetch(url); const xmlText = await res.text();
             const matches = [...xmlText.matchAll(/<db>([\s\S]*?)<\/db>/gi)];
-            matches.forEach(match => {
-                const mt20id = getSafeTag('mt20id', match[1]); const startStr = getSafeTag('prfpdfrom', match[1]).replace(/\./g, '');
-                const endStr = getSafeTag('prfpdto', match[1]).replace(/\./g, ''); const title = getSafeTag('prfnm', match[1]);
+            
+            // 공연 목록을 돌면서 동시에 각각의 '상세 정보(예매처)'를 가져옵니다.
+            const kopisPromises = matches.map(async match => {
+                const mt20id = getSafeTag('mt20id', match[1]); 
+                const startStr = getSafeTag('prfpdfrom', match[1]).replace(/\./g, '');
+                const endStr = getSafeTag('prfpdto', match[1]).replace(/\./g, ''); 
+                const title = getSafeTag('prfnm', match[1]);
+                
                 if (title && isValidDate(startStr, endStr, stdate)) {
-                    results.push({ id: `kopis-${mt20id}`, title: title, category: "공연", location: getSafeTag('fcltynm', match[1]), start_date: startStr, end_date: endStr, price: "상세페이지 참조", source: "KOPIS", area: extractArea(regionName), url: getSmartLink('', title, true) });
+                    let finalUrl = '';
+                    
+                    try {
+                        // 공연 상세 API 호출
+                        const detailUrl = `http://www.kopis.or.kr/openApi/restful/pblprfr/${mt20id}?service=${KOPIS_KEY}`;
+                        const detailRes = await fetch(detailUrl);
+                        const detailXml = await detailRes.text();
+                        
+                        // <relurl> (예매처 URL) 태그 안의 주소 추출
+                        const relurlMatch = detailXml.match(/<relurl>([\s\S]*?)<\/relurl>/i);
+                        if (relurlMatch && relurlMatch[1]) {
+                            finalUrl = relurlMatch[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, '$1').trim();
+                        }
+                    } catch(e) {}
+
+                    // 예매처 정보가 없다면 요청하신 대로 네이버 검색으로 깔끔하게 대체!
+                    if (!finalUrl || !finalUrl.startsWith('http')) {
+                        finalUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(title + ' 예매')}`;
+                    }
+
+                    return { 
+                        id: `kopis-${mt20id}`, title: title, category: "공연", 
+                        location: getSafeTag('fcltynm', match[1]), start_date: startStr, end_date: endStr, 
+                        price: "상세페이지 참조", source: "KOPIS", area: extractArea(regionName), 
+                        url: finalUrl 
+                    };
                 }
+                return null;
             });
+
+            // 지역별 30개의 상세 정보 탐색이 끝날 때까지 기다렸다가 합칩니다.
+            const regionResults = await Promise.all(kopisPromises);
+            allResults = [...allResults, ...regionResults.filter(item => item !== null)];
         } catch (err) { }
     }
-    return results;
+    return allResults;
 }
+
+// ===== 기존 공공데이터/네이버 수집 함수들 (이전과 동일) =====
+async function fetchNaverBlogs(clientId, clientSecret) {
+    if (!clientId || !clientSecret) return [];
+    const regionConfigs = [
+        { search: '서울', area: '서울' }, { search: '부산', area: '부산' }, { search: '대구', area: '대구' }, { search: '인천', area: '인천' },
+        { search: '광주', area: '전남광주' }, { search: '대전', area: '대전' }, { search: '울산', area: '울산' }, { search: '세종', area: '세종' },
+        { search: '경기', area: '경기' }, { search: '강원', area: '강원' }, { search: '충북', area: '충북' }, { search: '충남', area: '충남' },
+        { search: '전북', area: '전북' }, { search: '전남', area: '전남광주' }, { search: '경북', area: '경북' }, { search: '경남', area: '경남' }, { search: '제주', area: '제주' }
+    ];
+    const d = new Date(); const startStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+    d.setMonth(d.getMonth() + 1); const endStr = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`;
+    const fetchPromises = regionConfigs.map(async (config, index) => {
+        const url = `https://openapi.naver.com/v1/search/blog.json?query=${encodeURIComponent(`${config.search} 주말 아이와 가볼만한 곳`)}&display=5&sort=sim`;
+        try {
+            const res = await fetch(url, { headers: { 'X-Naver-Client-Id': clientId, 'X-Naver-Client-Secret': clientSecret } });
+            const data = await res.json();
+            if (data.items) {
+                return data.items.map((item, itemIndex) => ({
+                    id: `naver-${config.search}-${itemIndex}`, title: `[${config.search} 추천] ` + item.title.replace(/<[^>]*>?/g, ''), category: "블로그 추천", location: "상세페이지 확인", start_date: startStr, end_date: endStr, price: "무료~유료", source: "네이버 검색", area: config.area, url: item.link
+                }));
+            }
+        } catch (e) {} return [];
+    });
+    const resultsArray = await Promise.all(fetchPromises); return resultsArray.flat();
+}
+
 async function fetchStdFestivals(key, todayStr) {
     const url = `http://api.data.go.kr/openapi/tn_pubr_public_cltur_fstvl_api?serviceKey=${key}&pageNo=1&numOfRows=100&type=json`; const results = [];
     try {
@@ -221,7 +233,6 @@ export async function GET() {
         const NAVER_SECRET = process.env.NAVER_CLIENT_SECRET;
         const todayStr = getTodayStr();
 
-        // 🚀 모든 공공데이터 + 네이버 블로그 검색을 동시에 실행!
         const results = await Promise.allSettled([
             fetchKopis(),
             fetchStdFestivals(DATA_KEY, todayStr),
@@ -232,7 +243,7 @@ export async function GET() {
             fetchRecreationalForests(DATA_KEY, todayStr),
             fetchRuralVillages(DATA_KEY, todayStr),
             fetchLocalCampgrounds(DATA_KEY, todayStr),
-            fetchNaverBlogs(NAVER_ID, NAVER_SECRET) // <- 네이버 수집기 합류!
+            fetchNaverBlogs(NAVER_ID, NAVER_SECRET)
         ]);
 
         let allEvents = [];
@@ -242,7 +253,6 @@ export async function GET() {
             }
         });
 
-        // 중복 제거 및 DB 적재
         const uniqueEvents = Array.from(new Map(allEvents.map(item => [item.id, item])).values());
         if (uniqueEvents.length === 0) return NextResponse.json({ success: true, message: "수집된 데이터가 없습니다." });
 
@@ -251,7 +261,7 @@ export async function GET() {
 
         return NextResponse.json({ 
             success: true, 
-            message: `성공! 공공데이터와 네이버 블로그 포함, 총 ${uniqueEvents.length}개의 데이터 적재 완료.` 
+            message: `성공! KOPIS 상세 및 네이버 포함 총 ${uniqueEvents.length}개 적재 완료.` 
         });
     } catch (error) {
         return NextResponse.json({ success: false, error: error.message }, { status: 500 });
